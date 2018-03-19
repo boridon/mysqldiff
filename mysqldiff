@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+
 use strict;
 use warnings;
 
@@ -8,13 +9,15 @@ my @tables = map {
     my $scheme;
     if (-e $_) {
         # file
-        my $create_table = slurp($_);
-        my $tmp_dbname = join '_', 'tmp', time();
-        system(qw/mysqladmin -uroot create/, $tmp_dbname);
-        system('mysql', '-uroot', $tmp_dbname, '-e', $create_table);
-        my @cmd = (qw/mysqldump -uroot --no-data=true/, $tmp_dbname);
-        $scheme = `@cmd`;
-        system(qw/mysql -uroot/, $tmp_dbname, '-e', "drop database $tmp_dbname");
+# mysqlに投入してdumpしない
+#       my $create_table = slurp($_);
+#       my $tmp_dbname = join '_', 'tmp', time();
+#       system(qw/mysqladmin -uroot create/, $tmp_dbname);
+#       system('mysql', '-uroot', $tmp_dbname, '-e', $create_table);
+#       my @cmd = (qw/mysqldump -uroot --no-data=true/, $tmp_dbname);
+#       $scheme = `@cmd`;
+#       system(qw/mysql -uroot/, $tmp_dbname, '-e', "drop database $tmp_dbname");
+        $scheme = slurp($_);
     } elsif (/ /) {
         # remote db
         my @cmd = (qw/mysqldump --no-data=true/, split /\s+/, $_);
@@ -98,6 +101,11 @@ sub diff {
     for (@$new) {
         $new_hash{$_->{table_name}} = $_;
     }
+    for my $name (@old_table_names) {
+        if (!$new_hash{$name}) {
+            $diff .= "DROP TABLE IF EXISTS $name;\n\n";
+        }
+    }
     for my $name (@new_table_names) {
         if ($old_hash{$name}) {
             my $old_hash = $old_hash{$name};
@@ -122,7 +130,7 @@ sub table_diff {
     return sprintf(
         "ALTER TABLE `%s` %s;\n\n",
         $name,
-        join(', ', @change),
+        join(",\n  ", @change),
     );
 }
 
@@ -130,27 +138,71 @@ sub column_diff {
     my ($old, $new) = @_;
     my $old_columns = $old->{columns};
     my $new_columns = $new->{columns};
-    my (@change, %old_hash, %new_hash, %all_hash);
+    my (@change, %old_hash, %new_hash, %drop_column);
+
+    my $prev = 'FIRST';
     for (@$old_columns) {
-        $old_hash{$_->{column}} = $_;
-        $all_hash{$_->{column}} = $_;
+        my $column_name = $_->{column};
+        $_->{prev} = $prev;
+        $old_hash{$column_name} = $_;
+        $old_hash{$prev}->{next} = $column_name;
+        $prev = $column_name;
     }
+    $prev = 'FIRST';
     for (@$new_columns) {
-        $new_hash{$_->{column}} = $_;
-        $all_hash{$_->{column}} = $_;
+        my $column_name = $_->{column};
+        $_->{prev} = $prev;
+        $new_hash{$column_name} = $_;
+        $new_hash{$prev}->{next} = $column_name;
+        $prev = $column_name;
     }
-    for my $column (sort keys %all_hash) {
+
+    # DROP 候補
+    for (@$old_columns) {
+        my $column = $_->{column};
         my $old_definition = $old_hash{$column}->{definition};
         my $new_definition = $new_hash{$column}->{definition};
-        if (!$old_definition) {
-            push @change, "ADD `$column` $new_definition";
-        } elsif (!$new_definition) {
-            push @change, "DROP `$column`";
-        } elsif ($old_definition ne $new_definition) {
-            push @change, "MODIFY `$column` $new_definition";
+        if (!$new_definition) {
+            my $prev = $_->{prev};
+            $drop_column{$column} = "$old_definition AFTER $prev";
         }
     }
-    return @change;
+
+    # ADD されるときにoldのDROP候補の中で
+    # definitionと直前のカラム名が一致する場合
+    # CHANGE(カラム名変更)にする
+    for (@$new_columns) {
+        my $column = $_->{column};
+        my $old_definition = $old_hash{$column}->{definition};
+        my $new_definition = $new_hash{$column}->{definition};
+        my $new_prev = $new_hash{$column}->{prev};
+        if (!$old_definition) {
+            my $change_flag = 0;
+            $new_definition .= " AFTER $new_prev";
+            foreach my $key(keys(%drop_column)){
+                if ($new_definition eq $drop_column{$key}) {
+                    push @change, "CHANGE `$key` `$column` $new_definition";
+                    $old_hash{$old_hash{$key}->{prev}}->{next} = $column;
+                    $old_hash{$old_hash{$key}->{next}}->{prev} = $column;
+                    delete($drop_column{$key});
+                    $change_flag = 1;
+                    last;
+                }
+            }
+            if (!$change_flag) {
+                push @change, "ADD `$column` $new_definition";
+            }
+        } elsif ($old_definition ne $new_definition) {
+            push @change, "MODIFY `$column` $new_definition AFTER $new_prev";
+        }
+    }
+
+    my @drop;
+    foreach my $key(keys(%drop_column)){
+        push @drop, "DROP `$key`";
+    }
+
+    return (@drop, @change);
 }
 
 sub key_diff {
@@ -219,3 +271,4 @@ mysqldiff - diff for mysql
   mysqldiff createtable1.sql createtable2.sql
 
 =cut
+
